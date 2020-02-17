@@ -1,4 +1,4 @@
-# rate-limiter
+# Rate Limiter
 Rate Limiting in Distributed Applications using Zookeeper
 
 PLEASE NOTE: that this is a POC, but still can be used in a production environment with small refactoring and making hardcoded sleeps and percentages configs

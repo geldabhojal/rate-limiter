@@ -1,6 +1,8 @@
 # rate-limiter
 Rate Limiting in Distributed Applications using Zookeeper
 
+PLEASE NOTE: that this is a POC, but still can be used in a production environment with small refactoring and making hardcoded sleeps and percentages configs
+
 In a distributed environment, the state needs to be mutated by different applications running in different processes and still be able to observe the same state across them. Zookeeper like distributed stores which provide with locking mechanism seems like a very good candidate for this. The way zookeeper provides locking is through a lock path, where every client trying to aquire lock comes and adds an EPHEMERAL node in that path. Zookeeper maintains a priority queue of the clients arriving in order and provides lock in that order.
 
 In our use case, we want to rate limit our user traffic over a certain period of time. The allowed rate(bandwidth) of the user gets refresh after every configured period called the RefreshWindow. Each individual rate limit node is able to update/see the same bandwidth utilization across using locks.

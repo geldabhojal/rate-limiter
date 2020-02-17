@@ -48,7 +48,6 @@ type RateLimit struct {
 	baseQuota         int64
 	totalAllowedQuota int64
 	usableQuotaLeft   int64
-	cTime             int64
 	mTime             int64
 	quotaLeft         int64
 	lock              *recipe.InterProcessMutex
@@ -112,8 +111,8 @@ func (rl *RateLimit) addWatch() {
 		log.Println(err)
 	}
 	rl.quotaLeft = int64(rl.baseQuota)
-	// check for last refreshed  and createTime fo refresh node to use for refresh time calculations
-	rl.mTime, rl.cTime = rl.watchRefreshNode(rl.refreshQuotaPath, rl.refreshQuotaEvent)
+	// check for last mTime on refresh node to use for refresh time calculations
+	rl.mTime = rl.watchRefreshNode(rl.refreshQuotaPath, rl.refreshQuotaEvent)
 	log.Println("last refresh happened ", time.Now().Unix()-rl.mTime, "seconds ago")
 
 	// concurrently look to refresh quota
@@ -142,10 +141,7 @@ func main() {
 	client := curator.NewClient("localhost:2181", retryPolicy)
 	client.Start()
 	defer client.Close()
-	// where to close zookeeper connection
-	//defer rl.client.Stop()
 	_ = NewRateLimit(client, "bhojal", 100000, 100, 5*time.Second, 60*time.Second)
-	//100/m rate
 
 	shutdownChannel := make(chan os.Signal, 2)
 	signal.Notify(shutdownChannel, syscall.SIGINT, syscall.SIGTERM)
@@ -218,7 +214,7 @@ func (rl *RateLimit) refreshQuota() {
 					}
 				} else if rl.usableQuotaLeft > rl.totalAllowedQuota {
 					rl.lock.Release()
-					// we decide to make the system self correct itself by setting /quotas/usable equals to /quotas/total
+					// we can decide to make the system self correct itself by setting /quotas/usable equals to /quotas/total
 					log.Println("WARN: usable quota is more than total allowed , an impossible case unless somebody manually changed the 'quota/usable' in zookeeper")
 				} else {
 					// some other rate-limit node refreshed or this is the first time the application is starting up
@@ -233,7 +229,7 @@ func (rl *RateLimit) refreshQuota() {
 	}
 }
 
-// GetQuota take the size of the request and calculates usable bandwidth
+// VerifyQuota take the size of the request and calculates usable bandwidth
 // we should be using a channel for the user request to wait on GetQuota's
 // response which is if the user has exhausted it's quota or not
 func (rl *RateLimit) VerifyQuota(reqSize int64, response chan error) {
@@ -253,7 +249,7 @@ func (rl *RateLimit) VerifyQuota(reqSize int64, response chan error) {
 
 	// if local quota left is 20% of the base quota, request more parallely for optimization
 	if rl.quotaLeft <= int64(rl.baseQuota*20/100) && !rl.optimizing {
-		go rl.addBaseQuota()
+		go rl.getQuota()
 	}
 
 	if rl.quotaLeft >= 0 {
@@ -275,7 +271,7 @@ func (rl *RateLimit) requestQuota(reqSize int64, response chan error) {
 	}
 	defer rl.lock.Release()
 	if ok {
-		// this rate-limit node has used up it's base quota or may be usableQuotaLeft
+		// this rate-limit node has used up all the usableQuotaLeft
 		if reqSize > rl.usableQuotaLeft {
 			response <- QUOTA_EXHAUSTED
 		} else {
@@ -283,7 +279,7 @@ func (rl *RateLimit) requestQuota(reqSize int64, response chan error) {
 			response <- nil
 		}
 		log.Println("overall usable quota known is", rl.usableQuotaLeft)
-		// nupdate usableQuota in store with the new reduced value
+		// update usableQuota in store with the new reduced value
 		if rl.usableQuotaLeft-rl.baseQuota > 0 && rl.usableQuotaLeft-reqSize >= rl.baseQuota {
 			// take quota for itself
 			rl.quotaLock.Lock()
@@ -336,7 +332,7 @@ func (rl *RateLimit) relinquish() {
 	}
 }
 
-func (rl *RateLimit) addBaseQuota() {
+func (rl *RateLimit) getQuota() {
 	rl.optimizing = true
 	defer func() {
 		rl.optimizing = false
@@ -382,7 +378,7 @@ func (rl *RateLimit) watch(path string, callback func(*zk.Event)) []byte {
 	return b
 }
 
-func (rl *RateLimit) watchRefreshNode(path string, callback func(*zk.Event)) (int64, int64) {
+func (rl *RateLimit) watchRefreshNode(path string, callback func(*zk.Event)) int64 {
 	stat, err := rl.client.CheckExists().UsingWatcher(curator.NewWatcher(callback)).ForPath(path)
 	if err != nil {
 		log.Fatalf("check exists failed", err)
@@ -390,7 +386,7 @@ func (rl *RateLimit) watchRefreshNode(path string, callback func(*zk.Event)) (in
 	if stat == nil {
 		log.Fatal("Fatal: refresh node does not exist in zookeeper")
 	}
-	return stat.Mtime / 1000, stat.Ctime / 1000
+	return stat.Mtime / 1000
 }
 
 func (rl *RateLimit) usableQuotaEvent(event *zk.Event) {

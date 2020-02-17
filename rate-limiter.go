@@ -420,5 +420,5 @@ func (rl *RateLimit) baseQuotaEvent(event *zk.Event) {
 }
 
 func (rl *RateLimit) refreshQuotaEvent(event *zk.Event) {
-	rl.mTime, rl.cTime = rl.watchRefreshNode(rl.refreshQuotaPath, rl.refreshQuotaEvent)
+	rl.mTime = rl.watchRefreshNode(rl.refreshQuotaPath, rl.refreshQuotaEvent)
 }

@@ -11,7 +11,7 @@ Algorithm and Design Decisions
 Input: RequestSize, Error Channel
 Output: error if the user has exhausted it's bandwidth the time window else nil
 
-#Procedure
+#### Procedure
 
 1) Create and set user specific quota paths in zookeeper.
 ```
@@ -70,7 +70,7 @@ if zk has sufficient usable quota {
 }
 ```
 
-#Optimizations
+#### Optimizations
 
 1) Because we would not want to add latency to the requests coming in, one thing that can be done is requests flowing through and quota being calculated parallely, that way even though some amount of data goes through, the next requests will fail with quota exhaustion. The response from the rate limit can be update in a HashMap which is {"test-user": 0}, where 0 meaning further requests cannot be sent in this time window. 
 This is something that can be decided in upstream.

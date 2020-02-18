@@ -36,40 +36,48 @@ type RateLimitService interface {
 
 // RateLimit rate limit a user
 type RateLimit struct {
-	username          string
-	usableQuotaPath   string
-	baseQuotaPath     string
-	totalQuotaPath    string
-	refreshQuotaPath  string
-	quotaLock         sync.Mutex
-	m                 sync.Mutex
-	lockTimeout       time.Duration
-	refreshWindow     time.Duration
-	baseQuota         int64
-	totalAllowedQuota int64
-	usableQuotaLeft   int64
-	mTime             int64
-	quotaLeft         int64
-	lock              *recipe.InterProcessMutex
-	client            curator.CuratorFramework
-	optimizing        bool
+	username            string
+	usableQuotaPath     string
+	baseQuotaPath       string
+	totalQuotaPath      string
+	refreshQuotaPath    string
+	quotaLock           sync.Mutex
+	m                   sync.Mutex
+	lockTimeout         time.Duration
+	refreshWindow       time.Duration
+	baseQuota           int64
+	totalAllowedQuota   int64
+	usableQuotaLeft     int64
+	mTime               int64
+	quotaLeft           int64
+	lock                *recipe.InterProcessMutex
+	client              curator.CuratorFramework
+	optimizing          bool
+	optimizationPctAsk  float64
+	optimizationPctLeft float64
+	enableOptimization  bool
 }
 
+// NewRateLimiter starts rate limiting a user
+// PLEASe NOTE: make optimization params optional
 func NewRateLimit(client curator.CuratorFramework, username string,
-	totalAllowedQuota, baseQuota int64, lockTimeout time.Duration, refreshWindow time.Duration) *RateLimit {
+	totalAllowedQuota, baseQuota int64, lockTimeout time.Duration, refreshWindow time.Duration, enableOptimization bool, optimizationPctAsk float64, optimizationPctLeft float64) *RateLimit {
 	var err error
 	rl := &RateLimit{
-		username:          username,
-		totalAllowedQuota: totalAllowedQuota,
-		usableQuotaLeft:   totalAllowedQuota,
-		baseQuota:         baseQuota,
-		lockTimeout:       lockTimeout,
-		refreshWindow:     refreshWindow,
-		client:            client,
-		baseQuotaPath:     prefix + "/" + username + baseSuffix,
-		usableQuotaPath:   prefix + "/" + username + usableSuffix,
-		totalQuotaPath:    prefix + "/" + username + totalSuffix,
-		refreshQuotaPath:  prefix + "/" + username + refreshSuffix,
+		username:            username,
+		totalAllowedQuota:   totalAllowedQuota,
+		usableQuotaLeft:     totalAllowedQuota,
+		baseQuota:           baseQuota,
+		lockTimeout:         lockTimeout,
+		refreshWindow:       refreshWindow,
+		client:              client,
+		baseQuotaPath:       prefix + "/" + username + baseSuffix,
+		usableQuotaPath:     prefix + "/" + username + usableSuffix,
+		totalQuotaPath:      prefix + "/" + username + totalSuffix,
+		refreshQuotaPath:    prefix + "/" + username + refreshSuffix,
+		optimizationPctAsk:  optimizationPctAsk,
+		optimizationPctLeft: optimizationPctLeft,
+		enableOptimization:  enableOptimization,
 	}
 
 	// initialize the lock to be used and inject it whereever required.
@@ -141,7 +149,7 @@ func main() {
 	client := curator.NewClient("localhost:2181", retryPolicy)
 	client.Start()
 	defer client.Close()
-	_ = NewRateLimit(client, "sri", 100000, 1000, 5*time.Second, 60*time.Second)
+	_ = NewRateLimit(client, "sri", 100, 5, 5*time.Second, 60*time.Second, true, 0.4, 0.2)
 
 	shutdownChannel := make(chan os.Signal, 2)
 	signal.Notify(shutdownChannel, syscall.SIGINT, syscall.SIGTERM)
@@ -249,7 +257,7 @@ func (rl *RateLimit) VerifyQuota(reqSize int64, response chan error) {
 	rl.quotaLock.Unlock()
 
 	// if local quota left is 20% of the base quota, request more parallely for optimization
-	if rl.quotaLeft <= int64(rl.baseQuota*20/100) && !rl.optimizing {
+	if rl.enableOptimization && rl.quotaLeft <= int64(float64(rl.baseQuota)*float64(rl.optimizationPctLeft)) && !rl.optimizing {
 		go rl.getQuota()
 	}
 
@@ -350,13 +358,19 @@ func (rl *RateLimit) getQuota() {
 	}
 	defer rl.lock.Release()
 	if ok {
-		log.Println("optimizing by pulling 20% base quota")
+		log.Println("optimizing by pulling", int64(rl.optimizationPctAsk*100), "% of the base quota more")
 		if rl.usableQuotaLeft >= rl.baseQuota {
 			rl.quotaLock.Lock()
-			rl.quotaLeft = int64(float64(rl.quotaLeft) + float64(0.4)*float64(rl.baseQuota))
+			rl.quotaLeft = int64(float64(rl.quotaLeft) + float64(rl.optimizationPctAsk)*float64(rl.baseQuota))
 			rl.quotaLock.Unlock()
-			log.Println("new local quota ", rl.quotaLeft)
-			newUsableQuota := int64(float64(rl.usableQuotaLeft) - float64(0.4)*float64(rl.baseQuota))
+			newUsableQuota := int64(float64(rl.usableQuotaLeft) - float64(rl.optimizationPctAsk)*float64(rl.baseQuota))
+			if newUsableQuota <= 0 {
+				// because the quota was being consumed parallely
+				newUsableQuota = 0
+				log.Println("new usable quota is 0 because quota was being consumed concurrently")
+				return
+			}
+			log.Println("new local quota ", newUsableQuota)
 			err := rl.set(rl.usableQuotaPath, []byte(strconv.FormatInt(newUsableQuota, 10)))
 			if err != nil {
 				log.Println("updating usable quota failed ", err)

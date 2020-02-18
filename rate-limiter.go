@@ -298,7 +298,7 @@ func (rl *RateLimit) requestQuota(reqSize int64, response chan error) {
 			// adding extra safety check here to avoid case where in the event from the 'just' happened refresh hasn't reached
 			// by the time this condition aquires the lock and try's to process this else condition and set the usableQuota back to 0
 			// HIGHLY unlikely and rare but you never know...
-			if rl.usableQuotaLeft-rl.baseQuota <= 0 && time.Now().Unix()-rl.mTime < int64(rl.refreshWindow.Seconds()) {
+			if rl.usableQuotaLeft <= rl.baseQuota {
 				// update usableQuota with 0 since user does not have usable quota and wait for the refreshWindow
 				err := rl.set(rl.usableQuotaPath, []byte(strconv.FormatInt(0, 10)))
 				if err != nil {

@@ -26,13 +26,10 @@ const (
 	lockPath = "/lock-"
 )
 
+//nolint: gochecknoglobals
 var (
-	QUOTA_EXHAUSTED = errors.New("quota exhausted for time period message, waiting to be refreshed")
+	errQuotaExhausted = errors.New("quota exhausted for time period message, waiting to be refreshed")
 )
-
-type RateLimitService interface {
-	VerifyQuota(int64, chan error)
-}
 
 // RateLimit rate limit a user
 type RateLimit struct {
@@ -53,15 +50,16 @@ type RateLimit struct {
 	lock                *recipe.InterProcessMutex
 	client              curator.CuratorFramework
 	optimizing          bool
+	enableOptimization  bool
 	optimizationPctAsk  float64
 	optimizationPctLeft float64
-	enableOptimization  bool
 }
 
 // NewRateLimiter starts rate limiting a user
 // PLEASe NOTE: make optimization params optional
 func NewRateLimit(client curator.CuratorFramework, username string,
-	totalAllowedQuota, baseQuota int64, lockTimeout time.Duration, refreshWindow time.Duration, enableOptimization bool, optimizationPctAsk float64, optimizationPctLeft float64) *RateLimit {
+	totalAllowedQuota, baseQuota int64, lockTimeout time.Duration, refreshWindow time.Duration,
+	enableOptimization bool, optimizationPctAsk float64, optimizationPctLeft float64) (*RateLimit, error) {
 	var err error
 	rl := &RateLimit{
 		username:            username,
@@ -80,24 +78,46 @@ func NewRateLimit(client curator.CuratorFramework, username string,
 		enableOptimization:  enableOptimization,
 	}
 
-	// initialize the lock to be used and inject it whereever required.
+	// initialize the lock to be used and inject it wherever required.
 	rl.lock, err = recipe.NewInterProcessMutex(rl.client, lockPath+username)
 	if err != nil {
-		log.Fatalf("distributed lock to zookeeper could not be initialized", err)
+		return nil, err
 	}
 
-	rl.create(prefix, []byte(""))
-	rl.create(prefix+"/"+rl.username, []byte(""))
+	err = rl.create(prefix, []byte(""))
+	if err != nil {
+		return nil, err
+	}
 
-	rl.create(rl.baseQuotaPath, []byte(strconv.FormatInt(rl.baseQuota, 10)))
+	err = rl.create(prefix+"/"+rl.username, []byte(""))
+	if err != nil {
+		return nil, err
+	}
 
-	rl.create(rl.totalQuotaPath, []byte(strconv.FormatInt(rl.totalAllowedQuota, 10)))
+	err = rl.create(rl.baseQuotaPath, []byte(strconv.FormatInt(rl.baseQuota, 10)))
+	if err != nil {
+		return nil, err
+	}
 
-	rl.create(rl.usableQuotaPath, []byte(strconv.FormatInt(rl.usableQuotaLeft, 10)))
+	err = rl.create(rl.totalQuotaPath, []byte(strconv.FormatInt(rl.totalAllowedQuota, 10)))
+	if err != nil {
+		return nil, err
+	}
 
-	rl.create(rl.refreshQuotaPath, []byte(""))
+	err = rl.create(rl.usableQuotaPath, []byte(strconv.FormatInt(rl.usableQuotaLeft, 10)))
+	if err != nil {
+		return nil, err
+	}
 
-	rl.addWatch()
+	err = rl.create(rl.refreshQuotaPath, []byte(""))
+	if err != nil {
+		return nil, err
+	}
+
+	err = rl.addWatch()
+	if err != nil {
+		return nil, err
+	}
 
 	// concurrently look to refresh quota
 	go rl.refreshQuota()
@@ -107,29 +127,41 @@ func NewRateLimit(client curator.CuratorFramework, username string,
 	// quota gets concentrated on a single rate limit node
 	go rl.relinquish()
 
-	return rl
+	return rl, nil
 }
 
-func (rl *RateLimit) addWatch() {
-	var err error
-	rl.baseQuota, err = strconv.ParseInt(string(rl.watch(rl.baseQuotaPath, rl.baseQuotaEvent)), 10, 64)
+func (rl *RateLimit) addWatch() error {
+	b, err := rl.watch(rl.baseQuotaPath, rl.baseQuotaEvent)
+	if err != nil {
+		return err
+	}
+	rl.baseQuota, err = strconv.ParseInt(string(b), 10, 64)
+	if err != nil {
+		return err
+	}
+	u, err := rl.watch(rl.usableQuotaPath, rl.usableQuotaEvent)
+	if err != nil {
+		return err
+	}
+	// get and watch the overall usable quota for the user that he is consuming from
+	rl.usableQuotaLeft, err = strconv.ParseInt(string(u), 10, 64)
 	if err != nil {
 		log.Println(err)
 	}
-	// get and watch the overall usable quota for the user that he is consuming from
-	rl.usableQuotaLeft, err = strconv.ParseInt(string(rl.watch(rl.usableQuotaPath, rl.usableQuotaEvent)), 10, 64)
+	t, err := rl.watch(rl.totalQuotaPath, rl.totalQuotaEvent)
 	if err != nil {
 		log.Println(err)
 	}
 	// get and watch the configured totalAllowedQuota
-	rl.totalAllowedQuota, err = strconv.ParseInt(string(rl.watch(rl.totalQuotaPath, rl.totalQuotaEvent)), 10, 64)
+	rl.totalAllowedQuota, err = strconv.ParseInt(string(t), 10, 64)
 	if err != nil {
 		log.Println(err)
 	}
-	rl.quotaLeft = int64(rl.baseQuota)
+	rl.quotaLeft = rl.baseQuota
 	// check for last mTime on refresh node to use for refresh time calculations
 	rl.mTime = rl.watchRefreshNode(rl.refreshQuotaPath, rl.refreshQuotaEvent)
 	log.Println("last refresh happened ", time.Now().Unix()-rl.mTime, "seconds ago")
+	return nil
 }
 
 func (rl *RateLimit) create(path string, data []byte) error {
@@ -147,9 +179,13 @@ func (rl *RateLimit) create(path string, data []byte) error {
 func main() {
 	retryPolicy := curator.NewExponentialBackoffRetry(time.Second, 3, 15*time.Second)
 	client := curator.NewClient("localhost:2181", retryPolicy)
-	client.Start()
+	err := client.Start()
+	if err != nil {
+		log.Fatal(err)
+	}
 	defer client.Close()
-	_ = NewRateLimit(client, "sri", 100, 5, 5*time.Second, 60*time.Second, true, 0.4, 0.2)
+	// nolint: errcheck
+	NewRateLimit(client, "sri", 100, 5, 5*time.Second, 60*time.Second, true, 0.4, 0.2)
 
 	shutdownChannel := make(chan os.Signal, 2)
 	signal.Notify(shutdownChannel, syscall.SIGINT, syscall.SIGTERM)
@@ -170,7 +206,6 @@ func (rl *RateLimit) startRequests() {
 			} else {
 				log.Println("request OK to be sent downstream")
 			}
-			return
 		}()
 		time.Sleep(500 * time.Millisecond)
 	}
@@ -193,15 +228,22 @@ func (rl *RateLimit) requestSize() int64 {
 func (rl *RateLimit) refreshQuota() {
 	for {
 		now := time.Now().Unix()
-		// Note: Because we Aquire the lock to refresh quota, we should keep refreshWindow to a reasonable value and not like every few seconds
+		// Note: Because we Acquire the lock to refresh quota, we should keep
+		// refreshWindow to a reasonable value and not like every few seconds
 		if now-rl.mTime >= int64(rl.refreshWindow.Seconds()) {
 			ok, err := rl.lock.Acquire()
 			if err != nil {
 				log.Println(err)
 				return
 			}
-			defer rl.lock.Release()
+			defer func() {
+				err = rl.lock.Release()
+				if err != nil {
+					log.Println(err)
+				}
+			}()
 			if ok {
+				//nolint: gocritic
 				// refresh only if the usableQuotaLeft is <=total allowed quota
 				// check for time.Now().Unix()-mTime again incase another node just refreshed
 				if rl.usableQuotaLeft <= rl.totalAllowedQuota && time.Now().Unix()-rl.mTime >= int64(rl.refreshWindow.Seconds()) {
@@ -216,18 +258,27 @@ func (rl *RateLimit) refreshQuota() {
 					if err != nil {
 						log.Println("refreshing quota failed ", err)
 						return
-					} else {
-						rl.lock.Release()
-						log.Println("QUOTA REFRESHED")
 					}
+					err = rl.lock.Release()
+					if err != nil {
+						log.Println(err)
+					}
+					log.Println("QUOTA REFRESHED")
 				} else if rl.usableQuotaLeft > rl.totalAllowedQuota {
-					rl.lock.Release()
+					err = rl.lock.Release()
+					if err != nil {
+						log.Println(err)
+					}
 					// we can decide to make the system self correct itself by setting /quotas/usable equals to /quotas/total
-					log.Println("WARN: usable quota is more than total allowed , an impossible case unless somebody manually changed the 'quota/usable' in zookeeper")
+					log.Println(`WARN: usable quota is more than total allowed , 
+					an impossible case unless somebody manually changed the 'quota/usable' in zookeeper`)
 				} else {
 					// some other rate-limit node refreshed or this is the first time the application is starting up
 					log.Println("the quota was recently refreshed, need not be refreshed")
-					rl.lock.Release()
+					err = rl.lock.Release()
+					if err != nil {
+						log.Println(err)
+					}
 				}
 			}
 		}
@@ -253,23 +304,23 @@ func (rl *RateLimit) VerifyQuota(reqSize int64, response chan error) {
 		return
 	}
 	rl.quotaLock.Lock()
-	rl.quotaLeft = rl.quotaLeft - int64(reqSize)
+	rl.quotaLeft -= reqSize
 	rl.quotaLock.Unlock()
 
-	// if local quota left is 20% of the base quota, request more parallely for optimization
-	if rl.enableOptimization && rl.quotaLeft <= int64(float64(rl.baseQuota)*float64(rl.optimizationPctLeft)) && !rl.optimizing {
+	// if local quota left is 20% of the base quota, request more parallelly for optimization
+	if rl.enableOptimization && rl.quotaLeft <= int64(float64(rl.baseQuota)*rl.optimizationPctLeft) && !rl.optimizing {
 		go rl.getQuota()
 	}
 
 	if rl.quotaLeft >= 0 {
-		log.Println("user has bandwidth to pass through request with size  ", int64(reqSize), " local quota left ", rl.quotaLeft)
+		log.Println("user has bandwidth to pass through request with size  ", reqSize, " local quota left ", rl.quotaLeft)
 		response <- nil
 		return
-	} else {
-		log.Println("base quota not enough for the request size, requesting more..")
-		// request more local quota from zookeeper
-		rl.requestQuota(reqSize, response)
 	}
+	log.Println("base quota not enough for the request size, requesting more..")
+	// request more local quota from zookeeper
+	rl.requestQuota(reqSize, response)
+
 }
 
 func (rl *RateLimit) requestQuota(reqSize int64, response chan error) {
@@ -278,11 +329,16 @@ func (rl *RateLimit) requestQuota(reqSize int64, response chan error) {
 		log.Println(err)
 		return
 	}
-	defer rl.lock.Release()
+	defer func() {
+		err = rl.lock.Release()
+		if err != nil {
+			log.Println(err)
+		}
+	}()
 	if ok {
 		// this rate-limit node has used up all the usableQuotaLeft
 		if reqSize > rl.usableQuotaLeft {
-			response <- QUOTA_EXHAUSTED
+			response <- errQuotaExhausted
 		} else {
 			// let the request go through since user has usable bandwidth for refreshWindow
 			response <- nil
@@ -292,7 +348,7 @@ func (rl *RateLimit) requestQuota(reqSize int64, response chan error) {
 		if rl.usableQuotaLeft-rl.baseQuota > 0 && rl.usableQuotaLeft-reqSize >= rl.baseQuota {
 			// take quota for itself
 			rl.quotaLock.Lock()
-			rl.quotaLeft = int64(rl.baseQuota)
+			rl.quotaLeft = rl.baseQuota
 			rl.quotaLock.Unlock()
 			newUsableQuota := rl.usableQuotaLeft - reqSize - rl.quotaLeft
 			err := rl.set(rl.usableQuotaPath, []byte(strconv.FormatInt(newUsableQuota, 10)))
@@ -302,19 +358,18 @@ func (rl *RateLimit) requestQuota(reqSize int64, response chan error) {
 			}
 			log.Println("took ", rl.baseQuota, " from overall usable quota, updating usable quota to store:", newUsableQuota)
 			return
-		} else {
-			// adding extra safety check here to avoid case where in the event from the 'just' happened refresh hasn't reached
-			// by the time this condition aquires the lock and try's to process this else condition and set the usableQuota back to 0
+		} else if rl.usableQuotaLeft <= rl.baseQuota {
+			// adding extra safety check here to avoid case where in the event from the 'just'
+			// happened refresh hasn't reached by the time this condition aquires the lock and
+			// try's to process this else condition and set the usableQuota back to 0
 			// HIGHLY unlikely and rare but you never know...
-			if rl.usableQuotaLeft <= rl.baseQuota {
-				// update usableQuota with 0 since user does not have usable quota and wait for the refreshWindow
-				err := rl.set(rl.usableQuotaPath, []byte(strconv.FormatInt(0, 10)))
-				if err != nil {
-					log.Println("updating usable quota failed ", err)
-					return
-				}
-				log.Println("last quota bucket did not have enought, waiting for refresh")
+			// update usableQuota with 0 since user does not have usable quota and wait for the refreshWindow
+			err := rl.set(rl.usableQuotaPath, []byte(strconv.FormatInt(0, 10)))
+			if err != nil {
+				log.Println("updating usable quota failed ", err)
+				return
 			}
+			log.Println("last quota bucket did not have enought, waiting for refresh")
 		}
 	}
 }
@@ -329,7 +384,12 @@ func (rl *RateLimit) relinquish() {
 				log.Println(err)
 				return
 			}
-			defer rl.lock.Release()
+			defer func() {
+				err = rl.lock.Release()
+				if err != nil {
+					log.Println(err)
+				}
+			}()
 			if ok {
 				rl.quotaLock.Lock()
 				rl.usableQuotaLeft = rl.usableQuotaLeft + rl.quotaLeft - rl.baseQuota
@@ -356,16 +416,21 @@ func (rl *RateLimit) getQuota() {
 		log.Println(err)
 		return
 	}
-	defer rl.lock.Release()
+	defer func() {
+		err = rl.lock.Release()
+		if err != nil {
+			log.Println(err)
+		}
+	}()
 	if ok {
 		log.Println("optimizing by pulling", int64(rl.optimizationPctAsk*100), "% of the base quota more")
 		if rl.usableQuotaLeft >= rl.baseQuota {
 			rl.quotaLock.Lock()
-			rl.quotaLeft = int64(float64(rl.quotaLeft) + float64(rl.optimizationPctAsk)*float64(rl.baseQuota))
+			rl.quotaLeft = int64(float64(rl.quotaLeft) + rl.optimizationPctAsk*float64(rl.baseQuota))
 			rl.quotaLock.Unlock()
-			newUsableQuota := int64(float64(rl.usableQuotaLeft) - float64(rl.optimizationPctAsk)*float64(rl.baseQuota))
+			newUsableQuota := int64(float64(rl.usableQuotaLeft) - rl.optimizationPctAsk*float64(rl.baseQuota))
 			if newUsableQuota <= 0 {
-				// because the quota was being consumed parallely
+				// because the quota was being consumed parallelly
 				newUsableQuota = 0
 				log.Println("new usable quota is 0 because quota was being consumed concurrently")
 				return
@@ -376,7 +441,8 @@ func (rl *RateLimit) getQuota() {
 				log.Println("updating usable quota failed ", err)
 				return
 			}
-			log.Println("optimization:took ", int64(float64(0.4)*float64(rl.baseQuota)), " from overall usable quota, updating usable quota to store:", newUsableQuota)
+			log.Println("optimization:took ", int64(float64(0.4)*float64(rl.baseQuota)),
+				" from overall usable quota, updating usable quota to store:", newUsableQuota)
 		} else {
 			log.Println("not enough usable quota left for optimization")
 		}
@@ -388,20 +454,24 @@ func (rl *RateLimit) set(path string, data []byte) error {
 	return err
 }
 
-func (rl *RateLimit) watch(path string, callback func(*zk.Event)) []byte {
+func (rl *RateLimit) watch(path string, callback func(*zk.Event)) ([]byte, error) {
 	b, err := rl.client.GetData().UsingWatcher(curator.NewWatcher(callback)).ForPath(path)
 	if err != nil {
-		log.Fatal("watcher failed ", err)
+		log.Println("watcher failed ", err)
+		return nil, err
 	}
 	q, err := strconv.ParseInt(string(b), 10, 64)
+	if err != nil {
+		return nil, err
+	}
 	log.Println(path, " quota for all goroutines was updated as ", q)
-	return b
+	return b, nil
 }
 
 func (rl *RateLimit) watchRefreshNode(path string, callback func(*zk.Event)) int64 {
 	stat, err := rl.client.CheckExists().UsingWatcher(curator.NewWatcher(callback)).ForPath(path)
 	if err != nil {
-		log.Fatalf("check exists failed", err)
+		log.Fatal("check exists failed", err)
 	}
 	if stat == nil {
 		log.Fatal("Fatal: refresh node does not exist in zookeeper")
@@ -413,7 +483,11 @@ func (rl *RateLimit) usableQuotaEvent(event *zk.Event) {
 	rl.quotaLock.Lock()
 	defer rl.quotaLock.Unlock()
 	var err error
-	rl.usableQuotaLeft, err = strconv.ParseInt(string(rl.watch(rl.usableQuotaPath, rl.usableQuotaEvent)), 10, 64)
+	u, err := rl.watch(rl.usableQuotaPath, rl.usableQuotaEvent)
+	if err != nil {
+		log.Println(err)
+	}
+	rl.usableQuotaLeft, err = strconv.ParseInt(string(u), 10, 64)
 	if err != nil {
 		log.Println(err)
 	}
@@ -423,7 +497,11 @@ func (rl *RateLimit) totalQuotaEvent(event *zk.Event) {
 	rl.quotaLock.Lock()
 	defer rl.quotaLock.Unlock()
 	var err error
-	rl.totalAllowedQuota, err = strconv.ParseInt(string(rl.watch(rl.totalQuotaPath, rl.totalQuotaEvent)), 10, 64)
+	t, err := rl.watch(rl.totalQuotaPath, rl.totalQuotaEvent)
+	if err != nil {
+		log.Println(err)
+	}
+	rl.totalAllowedQuota, err = strconv.ParseInt(string(t), 10, 64)
 	if err != nil {
 		log.Println(err)
 	}
@@ -433,7 +511,11 @@ func (rl *RateLimit) baseQuotaEvent(event *zk.Event) {
 	rl.quotaLock.Lock()
 	defer rl.quotaLock.Unlock()
 	var err error
-	rl.baseQuota, err = strconv.ParseInt(string(rl.watch(rl.baseQuotaPath, rl.baseQuotaEvent)), 10, 64)
+	b, err := rl.watch(rl.baseQuotaPath, rl.baseQuotaEvent)
+	if err != nil {
+		log.Println(err)
+	}
+	rl.baseQuota, err = strconv.ParseInt(string(b), 10, 64)
 	if err != nil {
 		log.Println(err)
 	}
